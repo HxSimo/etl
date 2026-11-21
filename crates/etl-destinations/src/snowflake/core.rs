@@ -1312,6 +1312,58 @@ mod tests {
         }
     }
 
+    /// A missing CDC mask prevents both view recovery and channel setup.
+    #[tokio::test]
+    async fn missing_cdc_mask_rejects_owned_table_without_ddl() {
+        let schema = replicated_schema();
+        let store = NotifyingStore::new();
+        let metadata = DestinationTableMetadata::new_applied(
+            "PUBLIC_USERS".into(),
+            schema.inner().snapshot_id,
+            schema.replication_mask().clone(),
+        );
+        store.store_table_schema(schema.inner().clone()).await.unwrap();
+        store.store_destination_table_metadata(schema.id(), metadata.clone()).await.unwrap();
+        store.update_table_state(schema.id(), TableState::Ready).await.unwrap();
+
+        let response = serde_json::json!({
+            "statementHandle": "test-statement",
+            "resultSetMetaData": {
+                "numRows": 4,
+                "rowType": [
+                    {"name": "column_name"}, {"name": "data_type"}, {"name": "default"}
+                ]
+            },
+            "data": [
+                ["id", r#"{"type":"FIXED","nullable":true}"#, null],
+                ["name", r#"{"type":"TEXT","nullable":true}"#, null],
+                ["_cdc_operation", r#"{"type":"TEXT","nullable":false}"#, null],
+                ["_cdc_sequence_number", r#"{"type":"TEXT","nullable":false}"#, null]
+            ]
+        })
+        .to_string();
+        let (url, server) = serve_sql_responses(vec![response.clone(), response]).await;
+        let destination = local_destination(&url, store.clone());
+
+        let startup_error = destination.startup().await.unwrap_err();
+        let channel_error = destination.writer.initialize_table(&schema).await.unwrap_err();
+
+        for error in [startup_error, channel_error] {
+            assert_eq!(error.kind(), ErrorKind::CorruptedTableSchema);
+            assert!(error.to_string().contains("missing column '_cdc_missing_columns'"));
+        }
+        assert_eq!(
+            store.get_destination_table_metadata(schema.id()).await.unwrap(),
+            Some(metadata)
+        );
+        assert!(!destination.writer.client.has_channel(schema.id()).await);
+        let requests = timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+        assert_eq!(
+            requests,
+            vec!["show columns in table \"test-db\".\"test-schema\".\"PUBLIC_USERS\""; 2]
+        );
+    }
+
     /// An owned table can reopen even when its renamed source cannot map to a
     /// new target.
     #[tokio::test]

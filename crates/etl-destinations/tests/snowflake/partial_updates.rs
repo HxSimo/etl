@@ -741,11 +741,11 @@ async fn materialization_query_composite_keys_and_native_values() {
     .await;
 }
 
-/// Exercises both automatic legacy upgrade and restart after the ALTER already
-/// completed, retaining real channel offsets and historical NULL semantics.
+/// Verifies that an explicit upgrade preserves real channel offsets and
+/// historical NULL semantics across restarts.
 #[tokio::test]
 #[ignore = "requires Snowflake test credentials"]
-async fn legacy_format_upgrade_preserves_history_and_offsets() {
+async fn manual_mask_migration_preserves_history_and_offsets() {
     use etl::destination::Destination as _;
 
     let auth = build_auth();
@@ -799,22 +799,26 @@ async fn legacy_format_upgrade_preserves_history_and_offsets() {
         // here constructs the old physical format, including a key delete.
         sql.drop_column(&physical, "_cdc_missing_columns").await.unwrap();
         let metadata = store.get_destination_table_metadata(schema.id()).await.unwrap();
-        let upgraded = Destination::new(
+        let unmigrated = Destination::new(
             Client::new(Arc::clone(&auth), 1174.to_string().into()),
             store.clone(),
         );
-        // Opening upgrades the table and skips both committed events.
-        write_events(&upgraded, WriteEventsDurability::RequireDurable, committed_events.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            upgraded.fetch_committed_offset(schema.id()).await.unwrap(),
-            Some(before.clone())
-        );
+        let error = write_events(
+            &unmigrated,
+            WriteEventsDurability::RequireDurable,
+            committed_events.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::CorruptedTableSchema);
+        assert!(error.to_string().contains("missing column '_cdc_missing_columns'"));
         assert_eq!(store.get_destination_table_metadata(schema.id()).await.unwrap(), metadata);
-        upgraded.shutdown().await.unwrap();
-        // Reopen before new writes: the ARRAY column exists, historical masks
-        // are still NULL, and committed events must still be skipped.
+        unmigrated.shutdown().await.unwrap();
+
+        sql.add_column(&physical, "_cdc_missing_columns", "ARRAY", None).await.unwrap();
+
+        // The explicit ALTER leaves historical masks NULL and committed events
+        // must still be skipped.
         let upgraded = Destination::new(
             Client::new(Arc::clone(&auth), 1174.to_string().into()),
             store.clone(),
@@ -876,10 +880,10 @@ async fn legacy_format_upgrade_preserves_history_and_offsets() {
     .await;
 }
 
-/// An almost-legacy table is not an automatic repair request.
+/// Rejects schema mismatches without modifying the raw table.
 #[tokio::test]
 #[ignore = "requires Snowflake test credentials"]
-async fn legacy_upgrade_rejects_unrelated_schema_damage() {
+async fn existing_table_rejects_schema_damage() {
     use etl::destination::Destination as _;
 
     let auth = build_auth();
@@ -908,15 +912,23 @@ async fn legacy_upgrade_rejects_unrelated_schema_damage() {
                 DestinationWriteStatus::Durable
             );
             original.shutdown().await.unwrap();
-            sql.drop_column(&physical, "_cdc_missing_columns").await.unwrap();
-            match damage {
-                "extra" => sql.add_column(&physical, "unexpected", "VARCHAR", None).await.unwrap(),
-                "missing" => sql.drop_column(&physical, "payload").await.unwrap(),
-                _ => sql
-                    .add_column(&physical, "_cdc_missing_columns", "VARCHAR", None)
-                    .await
-                    .unwrap(),
-            }
+            let (error_kind, mask_type) = match damage {
+                "extra" => {
+                    sql.add_column(&physical, "unexpected", "VARCHAR", None).await.unwrap();
+                    (ErrorKind::CorruptedTableSchema, "ARRAY")
+                }
+                "missing" => {
+                    sql.drop_column(&physical, "payload").await.unwrap();
+                    (ErrorKind::CorruptedTableSchema, "ARRAY")
+                }
+                _ => {
+                    sql.drop_column(&physical, "_cdc_missing_columns").await.unwrap();
+                    sql.add_column(&physical, "_cdc_missing_columns", "VARCHAR", None)
+                        .await
+                        .unwrap();
+                    (ErrorKind::DestinationLayoutUnsupported, "TEXT")
+                }
+            };
             let restarted = Destination::new(
                 Client::new(Arc::clone(&auth), 1175.to_string().into()),
                 store.clone(),
@@ -932,26 +944,15 @@ async fn legacy_upgrade_rejects_unrelated_schema_damage() {
                 write_events(&restarted, WriteEventsDurability::RequireDurable, vec![event])
                     .await
                     .unwrap_err();
-            assert_eq!(
-                error.kind(),
-                if damage == "wrong_mask" {
-                    ErrorKind::DestinationLayoutUnsupported
-                } else {
-                    ErrorKind::CorruptedTableSchema
-                }
-            );
+            assert_eq!(error.kind(), error_kind);
             let fqn = format!("\"{}\".\"{}\".\"{physical}\"", config.database(), config.schema());
             let columns = query_rows(&sql, &format!("show columns in table {fqn}")).await.unwrap();
             let masks = columns
                 .iter()
                 .filter(|column| column[2] == "_cdc_missing_columns")
                 .collect::<Vec<_>>();
-            if damage == "wrong_mask" {
-                assert_eq!(masks.len(), 1);
-                assert_eq!(parse_json_cell(&masks[0][3])["type"], "TEXT");
-            } else {
-                assert!(masks.is_empty());
-            }
+            assert_eq!(masks.len(), 1);
+            assert_eq!(parse_json_cell(&masks[0][3])["type"], mask_type);
             restarted.shutdown().await.unwrap();
         })
         .await;

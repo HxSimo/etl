@@ -109,17 +109,14 @@ tables and both reserved view names.
 
 ### Existing destination tables
 
-For ETL-owned tables using the supported previous CDC format, ETL adds the
-nullable `_cdc_missing_columns` column before opening the write channel.
-Existing insert/update records have NULL metadata, interpreted as complete
-records within their replicated schema at event time. The upgrade preserves
-stored history and replication offsets and requires no backfill.
+ETL requires a nullable `_cdc_missing_columns` ARRAY column with no default
+before opening a write channel or preparing a companion view at startup. Before
+upgrading, migrate older CDC tables, including those owned by stopped pipelines.
+See the [destination upgrade instructions](https://supabase.github.io/etl/reference/destinations/#existing-destination-tables).
 
-The configured Snowflake role must allow the ALTER. Unrelated schema mismatches
-remain errors. ETL updates the table format; customer-owned queries must support
-partial records before consuming them. Existing deployments also need the
-`CREATE VIEW` grant before upgrading; ETL creates views for applied tables at
-startup.
+Customer-owned queries must support partial records before consuming them.
+Existing deployments also need the `CREATE VIEW` grant before upgrading because
+ETL creates views for applied tables at startup.
 
 ## Request Packing and Large Rows
 

@@ -699,18 +699,30 @@ that another replicated table still uses.
 
 ### Existing destination tables
 
-For ETL-owned tables using the supported previous CDC format, ETL validates the
-column set and CDC metadata, adds the nullable `_cdc_missing_columns` ARRAY
-column, and validates the result before opening the write channel. Existing
-insert/update records have NULL metadata, interpreted as complete within their
-replicated schema at event time. Historical deletes remain deletion boundaries.
-The upgrade preserves stored history and replication offsets and requires no
-backfill.
+ETL requires a nullable `_cdc_missing_columns` ARRAY column with no default. A
+missing column blocks write-channel setup and companion view reconciliation at
+startup.
 
-The configured Snowflake role must allow the ALTER. Unexpected schemas and
-metadata types remain errors. Customer-owned queries must support partial
-records before consuming them; automatic table upgrades do not update those
-queries. The materialization query requires `_cdc_missing_columns` to exist.
+Before upgrading ETL, check the raw tables owned by every pipeline, including
+stopped pipelines. For each table confirmed to use the CDC format from before
+partial updates, stop its pipeline and run the following with a Snowflake role
+that can alter the table. Substitute the exact database, schema, and raw table
+names, preserving case.
+
+```sql
+alter table "DATABASE"."SCHEMA"."RAW_TABLE"
+  add column "_cdc_missing_columns" array;
+```
+
+The new column is NULL for historical rows. ETL interprets those inserts and
+updates as complete within their replicated schema at event time. Historical
+deletes remain deletion boundaries. This change preserves stored history and
+replication offsets and requires no backfill. If the column was dropped from a
+table that already received partial updates, recover the original mask values
+before resuming replication. A NULL mask would cause those partial records to be
+interpreted as complete.
+
+Update customer-owned queries to support partial records before consuming them.
 
 ## Custom destinations and upstream support
 
